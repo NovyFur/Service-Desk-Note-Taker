@@ -24,60 +24,75 @@ class SearchIndex:
         """Load existing index or create a new one"""
         if os.path.exists(self.index_file):
             try:
-                with open(self.index_file, 'r') as f:
+                with open(self.index_file, 'r', encoding='utf-8') as f:
                     return json.load(f)
-            except:
+            except Exception as e: 
+                print(f"Error loading index file: {e}")
                 return {"files": {}, "last_update": ""}
         else:
             return {"files": {}, "last_update": ""}
     
     def save_index(self):
         """Save the index to disk"""
-        with open(self.index_file, 'w') as f:
-            json.dump(self.index, f)
-    
+        try:
+            with open(self.index_file, 'w', encoding='utf-8') as f: 
+                json.dump(self.index, f, indent=4) 
+        except Exception as e:
+             print(f"Error saving index file: {e}")
+
     def update_index(self):
         """Update the search index with all notes in the data directory"""
-        # Get all text files in the data directory
-        files = [f for f in os.listdir(self.data_dir) if f.endswith('.txt')]
-        
-        # Track new or modified files
+        try:
+            files = [f for f in os.listdir(self.data_dir) if f.endswith('.txt')]
+        except FileNotFoundError:
+            print(f"Error: Data directory not found: {self.data_dir}")
+            # Optionally create the directory here if desired
+            # os.makedirs(self.data_dir, exist_ok=True) 
+            return False 
+
         updated = False
-        
+        indexed_files = set(self.index["files"].keys())
+        current_files = set(files)
+
         for filename in files:
-            file_path = os.path.join(self.data_dir, filename)
-            file_stat = os.stat(file_path)
-            file_mtime = file_stat.st_mtime
-            
-            # Check if file is new or modified
-            if filename not in self.index["files"] or self.index["files"][filename]["mtime"] != file_mtime:
-                # Read file content
-                with open(file_path, 'r') as f:
-                    content = f.read()
+            try:
+                file_path = os.path.join(self.data_dir, filename)
+                file_stat = os.stat(file_path)
+                file_mtime = file_stat.st_mtime
                 
-                # Extract ticket number if present
-                ticket_match = re.search(r'ticket[_\s]*(\d+)', filename, re.IGNORECASE)
-                ticket_num = ticket_match.group(1) if ticket_match else ""
-                
-                # Store file info and content in index
-                self.index["files"][filename] = {
-                    "content": content,
-                    "mtime": file_mtime,
-                    "ticket": ticket_num,
-                    "path": file_path
-                }
-                updated = True
+                if filename not in self.index["files"] or self.index["files"][filename].get("mtime") != file_mtime: # Use .get for safety
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as f: 
+                            content = f.read()
+                    except Exception as e:
+                        print(f"Error reading file {filename}: {e}")
+                        continue 
+                    
+                    ticket_match = re.search(r'ticket[_\s]*(\d+)', filename, re.IGNORECASE)
+                    ticket_num = ticket_match.group(1) if ticket_match else ""
+                    
+                    self.index["files"][filename] = {
+                        "title": filename, 
+                        "content": content,
+                        "mtime": file_mtime,
+                        "ticket": ticket_num, 
+                        "path": file_path
+                    }
+                    updated = True
+            except Exception as e:
+                print(f"Error processing file {filename}: {e}")
+                continue 
+
+        files_to_remove = indexed_files - current_files
+        for filename in files_to_remove:
+            if filename in self.index["files"]:
+                 del self.index["files"][filename]
+                 updated = True
         
-        # Remove entries for deleted files
-        for filename in list(self.index["files"].keys()):
-            if filename not in files:
-                del self.index["files"][filename]
-                updated = True
-        
-        # Update last update timestamp
         if updated:
             self.index["last_update"] = datetime.datetime.now().isoformat()
             self.save_index()
+            print(f"Search index updated. Total files indexed: {len(self.index['files'])}")
         
         return updated
     
@@ -87,41 +102,74 @@ class SearchIndex:
         self.update_index()
         
         # Normalize query
-        query = query.lower()
+        query = query.strip().lower()
+        if not query:
+            return [] # Return empty list for empty query
         results = []
         
         # Check if query is a ticket number
         is_ticket_search = query.isdigit()
         
         for filename, file_info in self.index["files"].items():
-            # For ticket number search
-            if is_ticket_search and query in file_info["ticket"]:
-                results.append({
-                    "filename": filename,
-                    "path": file_info["path"],
-                    "content": file_info["content"],
-                    "relevance": 100  # Highest relevance for exact ticket match
-                })
-            # For text search
-            elif query in file_info["content"].lower():
-                # Calculate relevance based on number of occurrences
-                content_lower = file_info["content"].lower()
-                occurrences = content_lower.count(query)
-                
-                # Higher relevance for occurrences in the beginning
-                first_pos = content_lower.find(query)
-                relevance = occurrences * 10
-                if first_pos < 100:  # If found in first 100 chars
-                    relevance += 20
-                
-                results.append({
-                    "filename": filename,
-                    "path": file_info["path"],
-                    "content": file_info["content"],
-                    "relevance": relevance
-                })
-        
-        # Sort by relevance
+            # Safely get data, defaulting to empty strings
+            content_lower = file_info.get("content", "").lower()
+            title_lower = file_info.get("title", "").lower() 
+            ticket_num = file_info.get("ticket", "") # String, might be ""
+
+            # Check for matches in each relevant field
+            query_in_content = query in content_lower
+            query_in_title = query in title_lower
+            # Check for partial ticket number match (if ticket_num exists)
+            query_in_ticket = bool(ticket_num and query in ticket_num) 
+
+            # If the query matches *any* field, calculate relevance
+            if query_in_content or query_in_title or query_in_ticket:
+                current_relevance = 0
+
+                # --- Relevance Calculation ---
+
+                # 1. Ticket Number Relevance (Highest Priority)
+                if query_in_ticket:
+                    if query == ticket_num: # Exact match gives huge boost
+                        current_relevance += 100 
+                    else: # Partial match gives significant boost
+                        current_relevance += 50 # Score for partial ticket match
+
+                # 2. Title Relevance (High Priority)
+                if query_in_title:
+                    title_occurrences = title_lower.count(query)
+                    # Add relevance based on occurrences in title
+                    current_relevance += title_occurrences * 15 
+                    # Add bonus for any match in title
+                    current_relevance += 10 
+
+                # 3. Content Relevance (Standard Priority)
+                if query_in_content:
+                    content_occurrences = content_lower.count(query)
+                    # Add relevance based on occurrences in content
+                    current_relevance += content_occurrences * 5 
+                    
+                    # Bonus for query appearing early in the content
+                    try:
+                        first_pos_content = content_lower.find(query)
+                        # Add bonus if found within the first 100 characters
+                        if first_pos_content != -1 and first_pos_content < 100: 
+                            current_relevance += 20
+                    except: 
+                        # Ignore potential errors if content isn't string-like (shouldn't happen here)
+                        pass 
+
+                # --- Add to results if relevant ---
+                # Ensure we only add if there was actually a match contributing relevance
+                if current_relevance > 0:
+                    results.append({
+                        "filename": filename,
+                        "path": file_info.get("path", ""), 
+                        "content": file_info.get("content", ""), 
+                        "relevance": current_relevance 
+                    })
+
+        # Sort results by relevance (highest first)
         results.sort(key=lambda x: x["relevance"], reverse=True)
         return results
 
